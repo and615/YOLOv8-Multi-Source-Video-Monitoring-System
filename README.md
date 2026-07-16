@@ -155,4 +155,17 @@ yolov8/
 
 ## License
 
-MIT
+GNU Affero General Public License v3.0
+
+
+🛠️ 获取免配置一键整合包
+本项目代码开源，欢迎开发者自行配置环境运行。
+如果您是零基础用户、企业客户，或者不想折腾复杂的 PyTorch、CUDA 显卡驱动配置，我们提供 开箱即用、双击即运行的 GPU 加速绿色整合包（约 5GB），并提供以下支持：
+
+⚙️ 完整的 Windows 10 一键免安装绿色运行环境
+
+⚡ 针对 Nvidia 10系老旧显卡的 CUDA/cuDNN 极速推理优化
+
+💬 专属的技术支持与定制功能开发（如特定报警对接、特定物体训练等）
+
+欢迎联系咨询： [andy615.white@gmail.com]
