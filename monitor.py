@@ -22,6 +22,11 @@ if platform.system() == "Windows":
 import numpy as np
 import cv2
 
+# 过滤追踪器的 "not enough matching points" 警告
+import warnings
+warnings.filterwarnings("ignore", message=".*matching points.*")
+warnings.filterwarnings("ignore", message=".*track.*")
+
 # ---------------------------------------------------------------------------
 # 路径处理
 # ---------------------------------------------------------------------------
@@ -326,11 +331,32 @@ class VideoStreamThread(threading.Thread):
             consecutive_failures = 0
             frame_count += 1
 
-            # 推理
-            results = self.model.track(
-                frame, persist=True, classes=DETECT_CLASSES,
-                conf=0.4, iou=0.5, device=self.device, verbose=False
-            )
+            # 每 1000 帧重置追踪器，防止积累误差
+            if frame_count % 1000 == 0:
+                self.model = YOLO(os.path.join(MODELS_DIR, "yolov8m.pt"))
+                print(f"{tag} 帧#{frame_count} 追踪器已重置")
+
+            # 推理（带异常捕获，屏蔽追踪器警告）
+            old_stderr = sys.stderr
+            try:
+                # 临时重定向 stderr 屏蔽警告
+                sys.stderr = open(os.devnull, "w")
+                results = self.model.track(
+                    frame, persist=True, classes=DETECT_CLASSES,
+                    conf=0.4, iou=0.5, device=self.device, verbose=False
+                )
+            except Exception:
+                # 追踪器异常，重置并继续
+                self.model = YOLO(os.path.join(MODELS_DIR, "yolov8m.pt"))
+                print(f"{tag} 追踪器异常已自动恢复")
+                continue
+            finally:
+                # 恢复 stderr
+                try:
+                    sys.stderr.close()
+                except Exception:
+                    pass
+                sys.stderr = old_stderr
 
             has_target = False
             annotated = frame.copy()
