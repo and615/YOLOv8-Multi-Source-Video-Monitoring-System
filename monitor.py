@@ -21,11 +21,7 @@ if platform.system() == "Windows":
 
 import numpy as np
 import cv2
-
-# 过滤追踪器的 "not enough matching points" 警告
-import warnings
-warnings.filterwarnings("ignore", message=".*matching points.*")
-warnings.filterwarnings("ignore", message=".*track.*")
+from ultralytics import YOLO
 
 # ---------------------------------------------------------------------------
 # 路径处理
@@ -49,6 +45,7 @@ def read_config(config_path):
     sources = ["0"]
     show_window = True
     resolution = None  # 如 "1920x1080"
+    detect_interval = 1  # 每 N 帧检测一次，1=每帧都检测
     try:
         with open(config_path, "r", encoding="utf-8") as f:
             for line in f:
@@ -63,10 +60,12 @@ def read_config(config_path):
                 elif key == "show_window":
                     show_window = value.lower() in ("true", "1", "yes")
                 elif key == "resolution":
-                    resolution = value  # 如 "1920x1080"
+                    resolution = value
+                elif key == "detect_interval":
+                    detect_interval = max(1, int(value))
     except Exception as e:
         print(f"[警告] 读取配置失败: {e}，使用默认值")
-    return sources, show_window, resolution
+    return sources, show_window, resolution, detect_interval
 
 # ---------------------------------------------------------------------------
 # GPU 检测与模型加载（共享）
@@ -278,13 +277,14 @@ class AutoRecorder:
 # 单路视频源处理线程
 # ---------------------------------------------------------------------------
 class VideoStreamThread(threading.Thread):
-    def __init__(self, source_str, show_window, logger, shared_model, resolution=None):
+    def __init__(self, source_str, show_window, logger, shared_model, resolution=None, detect_interval=1):
         super().__init__(daemon=True)
         self.source_str = source_str
         self.source_type, self.source_value = classify_source(source_str)
         self.source_name = source_str.replace(":", "_").replace("/", "_").replace("\\", "_")[:20]
         self.show_window = show_window
         self.resolution = resolution
+        self.detect_interval = detect_interval
         self.logger = logger
         self.model, self.device = shared_model
         self.running = True
@@ -294,6 +294,14 @@ class VideoStreamThread(threading.Thread):
         tag = f"[{self.source_str}]"
         print(f"{tag} 启动监控线程...")
 
+        try:
+            self._run_inner(tag)
+        except Exception as e:
+            print(f"{tag} 线程异常: {e}")
+            import traceback
+            traceback.print_exc()
+
+    def _run_inner(self, tag):
         cap = open_video_source(self.source_type, self.source_value, self.resolution)
         if cap is None:
             print(f"{tag} 无法打开视频源，线程退出")
@@ -306,15 +314,19 @@ class VideoStreamThread(threading.Thread):
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         print(f"{tag} 已连接 {width}x{height} @ {fps:.1f}fps")
+        print(f"{tag} 开始检测循环...")
 
         consecutive_failures = 0
         frame_count = 0
+        last_results = None  # 缓存上次检测结果
         window_name = f"YOLOv8 - {self.source_str}"
 
         while self.running:
             ret, frame = cap.read()
             if not ret:
                 consecutive_failures += 1
+                if frame_count == 0:
+                    print(f"{tag} 首帧读取失败，ret={ret}")
                 if self.source_type == "rtsp" and consecutive_failures >= 10:
                     print(f"{tag} 断线，进入重连...")
                     cap = reconnect_rtsp(self.source_value)
@@ -330,33 +342,43 @@ class VideoStreamThread(threading.Thread):
 
             consecutive_failures = 0
             frame_count += 1
+            if frame_count == 1:
+                print(f"{tag} 首帧读取成功，开始检测")
 
-            # 每 1000 帧重置追踪器，防止积累误差
-            if frame_count % 1000 == 0:
-                self.model = YOLO(os.path.join(MODELS_DIR, "yolov8m.pt"))
+            # 每 5000 帧重置追踪器，防止积累误差
+            if frame_count % 5000 == 0:
+                old_stderr, devnull_fd = _suppress_output()
+                try:
+                    self.model = YOLO(os.path.join(MODELS_DIR, "yolov8m.pt"))
+                finally:
+                    _restore_output(old_stderr, devnull_fd)
                 print(f"{tag} 帧#{frame_count} 追踪器已重置")
 
-            # 推理（带异常捕获，屏蔽追踪器警告）
-            old_stderr = sys.stderr
-            try:
-                # 临时重定向 stderr 屏蔽警告
-                sys.stderr = open(os.devnull, "w")
-                results = self.model.track(
-                    frame, persist=True, classes=DETECT_CLASSES,
-                    conf=0.4, iou=0.5, device=self.device, verbose=False
-                )
-            except Exception:
-                # 追踪器异常，重置并继续
-                self.model = YOLO(os.path.join(MODELS_DIR, "yolov8m.pt"))
-                print(f"{tag} 追踪器异常已自动恢复")
-                continue
-            finally:
-                # 恢复 stderr
+            # 按间隔检测，降低 GPU 负载
+            need_detect = (frame_count % self.detect_interval == 0)
+
+            if need_detect:
+                # 推理（OS 级别屏蔽 C++ 追踪器警告）
+                old_stderr, devnull_fd = _suppress_output()
                 try:
-                    sys.stderr.close()
+                    results = self.model.track(
+                        frame, persist=True, classes=DETECT_CLASSES,
+                        conf=0.4, iou=0.5, device=self.device, verbose=False
+                    )
+                    last_results = results
                 except Exception:
-                    pass
-                sys.stderr = old_stderr
+                    last_results = None
+                finally:
+                    _restore_output(old_stderr, devnull_fd)
+
+                if last_results is None and results is None:
+                    # 推理失败，重置模型
+                    self.model = YOLO(os.path.join(MODELS_DIR, "yolov8m.pt"))
+                    print(f"{tag} 追踪器异常已自动恢复")
+                    continue
+                results = last_results
+            else:
+                results = last_results
 
             has_target = False
             annotated = frame.copy()
@@ -409,16 +431,36 @@ class VideoStreamThread(threading.Thread):
 # ---------------------------------------------------------------------------
 # 扫描可用摄像头
 # ---------------------------------------------------------------------------
+def _suppress_output():
+    """OS 级别屏蔽 stderr（C++ 警告）。返回 (old_stderr, devnull_fd)。"""
+    old_stderr = os.dup(2)
+    devnull_fd = os.open(os.devnull, os.O_WRONLY)
+    os.dup2(devnull_fd, 2)
+    return old_stderr, devnull_fd
+
+def _restore_output(old_stderr, devnull_fd):
+    """恢复 stderr。"""
+    try:
+        os.dup2(old_stderr, 2)
+        os.close(old_stderr)
+        os.close(devnull_fd)
+    except Exception:
+        pass
+
 def scan_cameras(max_scan=10):
-    """扫描系统可用的 USB 摄像头。"""
+    """扫描系统可用的 USB 摄像头（静默扫描）。"""
     available = []
-    for i in range(max_scan):
-        cap = cv2.VideoCapture(i, cv2.CAP_DSHOW)
-        if cap.isOpened():
-            w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-            h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            available.append((i, w, h))
-            cap.release()
+    old_stderr, devnull_fd = _suppress_output()
+    try:
+        for i in range(max_scan):
+            cap = cv2.VideoCapture(i, cv2.CAP_DSHOW)
+            if cap.isOpened():
+                w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                available.append((i, w, h))
+                cap.release()
+    finally:
+        _restore_output(old_stderr, devnull_fd)
     return available
 
 # ---------------------------------------------------------------------------
@@ -442,11 +484,13 @@ def main():
     print()
 
     # 读取配置
-    sources, show_window, resolution = read_config(CONFIG_PATH)
+    sources, show_window, resolution, detect_interval = read_config(CONFIG_PATH)
     print(f"[配置] 视频源: {sources}")
     print(f"[配置] 显示窗口: {show_window}")
     if resolution:
         print(f"[配置] USB 摄像头分辨率: {resolution}")
+    if detect_interval > 1:
+        print(f"[配置] 检测间隔: 每 {detect_interval} 帧检测一次")
     print()
 
     # 加载模型
@@ -458,7 +502,7 @@ def main():
     # 启动各路视频线程
     threads = []
     for src in sources:
-        t = VideoStreamThread(src, show_window, logger, shared_model, resolution)
+        t = VideoStreamThread(src, show_window, logger, shared_model, resolution, detect_interval)
         threads.append(t)
         t.start()
         time.sleep(0.5)  # 错开启动
@@ -484,4 +528,10 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        print(f"[致命错误] {e}")
+        import traceback
+        traceback.print_exc()
+        input("按回车键退出...")
